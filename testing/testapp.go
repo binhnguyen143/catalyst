@@ -2,6 +2,7 @@ package testing
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -14,6 +15,9 @@ import (
 
 func App(t *testing.T) (*app.App, func(), *counter.Counter) {
 	t.Helper()
+	if os.Getenv("CATALYST_DATABASE_URL") == "" && os.Getenv("DATABASE_URL") == "" {
+		t.Skip("missing CATALYST_DATABASE_URL or DATABASE_URL")
+	}
 
 	dir := t.TempDir()
 

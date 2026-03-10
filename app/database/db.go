@@ -7,73 +7,90 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // import sqlite driver
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/require"
 
 	"github.com/SecurityBrewery/catalyst/app/database/sqlc"
 )
 
-const sqliteDriver = "sqlite3"
+const postgresDriver = "pgx"
+
+var schemaNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_]`)
 
 func DB(ctx context.Context, dir string) (*sqlc.Queries, func(), error) {
-	filename := filepath.Join(dir, "data.db")
-
-	slog.InfoContext(ctx, "Connecting to database", "path", filename)
-
-	// see https://briandouglas.ie/sqlite-defaults/ for more details
-	pragmas := []string{
-		// Enable WAL mode for better concurrency
-		"journal_mode=WAL",
-		// Enable synchronous mode for better data integrity
-		"synchronous=NORMAL",
-		// Set busy timeout to 5 seconds
-		"busy_timeout=5000",
-		// Set cache size to 20MB
-		"cache_size=-20000",
-		// Enable foreign key checks
-		"foreign_keys=ON",
-		// Enable incremental vacuuming
-		"auto_vacuum=INCREMENTAL",
-		// Set temp store to memory
-		"temp_store=MEMORY",
-		// Set mmap size to 2GB
-		"mmap_size=2147483648",
-		// Set page size to 8192
-		"page_size=8192",
+	dsn := os.Getenv("CATALYST_DATABASE_URL")
+	if dsn == "" {
+		dsn = os.Getenv("DATABASE_URL")
 	}
 
-	_ = os.MkdirAll(filepath.Dir(filename), 0o755)
+	if dsn == "" {
+		return nil, nil, fmt.Errorf("missing database dsn: set CATALYST_DATABASE_URL or DATABASE_URL")
+	}
 
-	write, err := sql.Open(sqliteDriver, fmt.Sprintf("file:%s", filename))
+	schemaName := schemaName(dir)
+	slog.InfoContext(ctx, "Connecting to PostgreSQL", "schema", schemaName)
+
+	admin, err := sql.Open(postgresDriver, dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open database: %w", err)
 	}
+	defer func() {
+		_ = admin.Close()
+	}()
 
-	write.SetMaxOpenConns(1)
-	write.SetConnMaxIdleTime(time.Minute)
-
-	for _, pragma := range pragmas {
-		if _, err := write.ExecContext(ctx, fmt.Sprintf("PRAGMA %s", pragma)); err != nil {
-			return nil, nil, fmt.Errorf("failed to set pragma %s: %w", pragma, err)
-		}
+	if _, err := admin.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", quoteIdentifier(schemaName))); err != nil {
+		return nil, nil, fmt.Errorf("failed to create schema %q: %w", schemaName, err)
 	}
 
-	read, err := sql.Open(sqliteDriver, fmt.Sprintf("file:%s?mode=ro", filename))
+	read, err := openDBWithSchema(dsn, schemaName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, nil, fmt.Errorf("failed to open read database: %w", err)
 	}
-
 	read.SetMaxOpenConns(100)
 	read.SetConnMaxIdleTime(time.Minute)
+	if err := read.PingContext(ctx); err != nil {
+		_ = read.Close()
+		return nil, nil, fmt.Errorf("failed to ping read database: %w", err)
+	}
+
+	write, err := openDBWithSchema(dsn, schemaName)
+	if err != nil {
+		_ = read.Close()
+		return nil, nil, fmt.Errorf("failed to open write database: %w", err)
+	}
+	write.SetMaxOpenConns(20)
+	write.SetConnMaxIdleTime(time.Minute)
+	if err := write.PingContext(ctx); err != nil {
+		_ = read.Close()
+		_ = write.Close()
+		return nil, nil, fmt.Errorf("failed to ping write database: %w", err)
+	}
 
 	queries := sqlc.New(read, write)
 
 	return queries, func() {
+		dropCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		drop, err := sql.Open(postgresDriver, dsn)
+		if err == nil {
+			if _, dropErr := drop.ExecContext(dropCtx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", quoteIdentifier(schemaName))); dropErr != nil {
+				slog.Error("failed to drop schema", "schema", schemaName, "error", dropErr)
+			}
+			if closeErr := drop.Close(); closeErr != nil {
+				slog.Error("failed to close drop connection", "error", closeErr)
+			}
+		} else {
+			slog.Error("failed to open drop connection", "error", err)
+		}
+
 		if err := read.Close(); err != nil {
 			slog.Error("failed to close read connection", "error", err)
 		}
@@ -85,11 +102,54 @@ func DB(ctx context.Context, dir string) (*sqlc.Queries, func(), error) {
 }
 
 func TestDB(t *testing.T, dir string) *sqlc.Queries {
-	queries, cleanup, err := DB(t.Context(), filepath.Join(dir, "data.db"))
+	t.Helper()
+	if os.Getenv("CATALYST_DATABASE_URL") == "" && os.Getenv("DATABASE_URL") == "" {
+		t.Skip("missing CATALYST_DATABASE_URL or DATABASE_URL")
+	}
+
+	queries, cleanup, err := DB(t.Context(), dir)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
 	return queries
+}
+
+func openDBWithSchema(dsn, schema string) (*sql.DB, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = map[string]string{}
+	}
+	cfg.RuntimeParams["search_path"] = schema
+	cfg.RuntimeParams["TimeZone"] = "UTC"
+
+	return stdlib.OpenDB(*cfg, stdlib.OptionAfterConnect(func(ctx context.Context, conn *pgx.Conn) error {
+		conn.TypeMap().RegisterType(&pgtype.Type{
+			Name:  "timestamptz",
+			OID:   pgtype.TimestamptzOID,
+			Codec: &pgtype.TimestamptzCodec{ScanLocation: time.UTC},
+		})
+
+		return nil
+	})), nil
+}
+
+func schemaName(seed string) string {
+	base := strings.ToLower(seed)
+	base = schemaNameSanitizer.ReplaceAllString(base, "_")
+	base = strings.Trim(base, "_")
+	if base == "" {
+		base = "catalyst"
+	}
+
+	return "catalyst_" + base + "_" + strings.ToLower(randomstring(8))
+}
+
+func quoteIdentifier(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 func GenerateID(prefix string) string {
