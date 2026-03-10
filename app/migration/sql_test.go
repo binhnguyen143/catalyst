@@ -3,7 +3,6 @@ package migration
 import (
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 
 	"github.com/SecurityBrewery/catalyst/app/database"
@@ -15,7 +14,7 @@ func TestSQLMigration_UpAndDown(t *testing.T) {
 
 	m := sqlMigration{
 		sqlName: "test_migration",
-		upSQL:   "CREATE TABLE test_table (id INTEGER PRIMARY KEY, name TEXT);",
+		upSQL:   "CREATE TABLE test_table (id SERIAL PRIMARY KEY, name TEXT);",
 	}
 
 	dir := t.TempDir()
